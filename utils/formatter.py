@@ -87,17 +87,14 @@ def _ad_line(ad_text: str | None, ad_link: str | None = None) -> str:
     return _default_ad_line()
 
 
-def _build(token_symbol, emoji, spent_sol, spent_usd, got_tokens, buyer, tx_url, price_usd, mcap_usd, tg_url, ad_text, ad_link, chart_url=None, spent_symbol="TON", spent_value=None, platform="ton", progress_bar=None):
-    platform_label = {"stonfi": "STON.fi", "dedust": "DeDust", "groypad": "Groypad", "blum": "Blum", "dex": "TON DEX"}.get((platform or "ton").lower(), "TON")
-    title = f'{premium_text_or_plain("moon", "🪐")} {_a(token_symbol, tg_url)} Buy on {platform_label}!'
+def _build(token_symbol, emoji, spent_sol, spent_usd, got_tokens, buyer, tx_url, price_usd, mcap_usd, tg_url, ad_text, ad_link, chart_url=None, spent_symbol="TON", spent_value=None):
+    title = f'{premium_text_or_plain("moon", "🪐")} {_a(token_symbol, tg_url)} Buy!'
     count = max(3, min(12, int(spent_sol * 4) or 3))
     display_value = spent_value if spent_value is not None else spent_sol
     usd_part = f" (${fmt_num(spent_usd, 2)})" if spent_usd > 0 else ""
     lines = [title, "", emoji_bar(emoji, count), ""]
     lines.append(f"{premium_text_or_plain('spent', '💵')} {fmt_spent_amount(display_value, spent_symbol)} {spent_symbol}{usd_part}")
     lines.append(f"{premium_text_or_plain('got', '🔁')} {fmt_num(got_tokens, 2)} {_a(token_symbol, tg_url)}")
-    if progress_bar:
-        lines.append(f"🚀 Bonding: <code>{escape(str(progress_bar))}</code>")
     lines.append(f"{premium_text_or_plain('wallet', '👤')} {_a(short_addr(buyer), tx_url)}: New! | {_a('Txn', tx_url)}")
     if price_usd is not None:
         lines.append(f"{premium_text_or_plain('price', '🏷')} Price: ${fmt_num(price_usd, 6)}")
