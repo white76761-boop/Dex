@@ -404,6 +404,11 @@ async def view_token(cq: CallbackQuery, db: DB):
 
 @router.callback_query(F.data == "menu:edit")
 async def menu_edit(cq: CallbackQuery, state: FSMContext, db: DB):
+    # Answer immediately so Telegram does not leave the button stuck on "Loading...".
+    try:
+        await cq.answer()
+    except Exception:
+        pass
     mint = None
     if cq.message and cq.message.chat.type in ("group", "supergroup"):
         mint = await _group_token(db, cq.message.chat.id)
@@ -412,35 +417,44 @@ async def menu_edit(cq: CallbackQuery, state: FSMContext, db: DB):
         await state.clear()
         text2, values = await _render_edit_page(db, mint)
         await cq.message.answer(text2, parse_mode="HTML", reply_markup=token_edit_page_kb(mint, 1, values))
-        return await cq.answer()
+        return
     tokens = await _tokens(db)
     if not tokens:
         await cq.message.answer("No tracked tokens yet.")
     else:
         await cq.message.answer("Hi, please select your token below.", reply_markup=token_list_kb(tokens, "edittoken", back="menu:home"))
-    await cq.answer()
 
 @router.callback_query(F.data.startswith("edittoken:"))
 async def edit_token(cq: CallbackQuery, state: FSMContext, db: DB):
+    try:
+        await cq.answer()
+    except Exception:
+        pass
     mint = cq.data.split(":", 1)[1]
     try:
         await _ensure_token_settings(db, mint)
         await state.clear()
         text2, values = await _render_edit_page(db, mint)
         await cq.message.answer(text2, parse_mode="HTML", reply_markup=token_edit_page_kb(mint, 1, values))
-        await cq.answer()
     except Exception as e:
         await cq.answer("Could not open token editor.", show_alert=True)
 
 @router.callback_query(F.data.startswith("editpage:"))
 async def edit_page(cq: CallbackQuery, db: DB):
+    try:
+        await cq.answer()
+    except Exception:
+        pass
     mint = cq.data.split(":")[1]
     text, values = await _render_edit_page(db, mint)
     await cq.message.answer(text, parse_mode="HTML", reply_markup=token_edit_page_kb(mint, 1, values))
-    await cq.answer()
 
 @router.callback_query(F.data.startswith("editset:"))
 async def edit_set(cq: CallbackQuery, state: FSMContext):
+    try:
+        await cq.answer()
+    except Exception:
+        pass
     _, mint, key = cq.data.split(":", 2)
     await state.clear()
     await state.set_state(EditTokenFlow.value)
@@ -453,7 +467,6 @@ async def edit_set(cq: CallbackQuery, state: FSMContext):
         "media": "Send a photo, GIF, or video to use as media, or type skip to clear it.",
     }
     await cq.message.answer(prompts.get(key, "Send value."))
-    await cq.answer()
 
 @router.message(EditTokenFlow.value)
 async def edit_token_value(msg: Message, state: FSMContext, db: DB):
