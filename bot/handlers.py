@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
 from bot.config import settings
-from bot.keyboards import main_menu_kb, token_list_kb, trending_package_kb, advert_duration_kb, invoice_kb, lang_kb, token_edit_page_kb
+from bot.keyboards import main_menu_kb, token_list_kb, trending_package_kb, advert_duration_kb, invoice_kb, lang_kb, token_edit_page_kb, token_ref
 from services.payment_verifier import find_recent_payment
 from services.ads_service import AdsService
 from services.token_meta import fetch_token_meta
@@ -129,6 +129,24 @@ def _normalize_emoji_input(msg: Message) -> str:
         return premium
     raw = (msg.text or '🟢').strip() or '🟢'
     return raw[:16]
+
+
+async def _resolve_token_ref(db: DB, ref: str) -> str | None:
+    """Resolve either a full TON mint or the short callback token ref."""
+    ref = (ref or '').strip()
+    if not ref:
+        return None
+    if CA_RE.match(ref):
+        return ref
+    conn = await db.connect()
+    cur = await conn.execute("SELECT mint FROM tracked_tokens")
+    rows = await cur.fetchall()
+    await conn.close()
+    for row in rows:
+        mint = row["mint"]
+        if token_ref(mint) == ref:
+            return mint
+    return None
 
 async def _tokens(db: DB) -> list[tuple[str, str]]:
     conn = await db.connect()
@@ -390,7 +408,10 @@ async def menu_view(cq: CallbackQuery, db: DB):
 
 @router.callback_query(F.data.startswith("viewtoken:"))
 async def view_token(cq: CallbackQuery, db: DB):
-    mint = cq.data.split(":", 1)[1]
+    ref = cq.data.split(":", 1)[1]
+    mint = await _resolve_token_ref(db, ref)
+    if not mint:
+        return await cq.answer("Token not found", show_alert=True)
     conn = await db.connect()
     cur = await conn.execute("SELECT * FROM tracked_tokens WHERE mint=?", (mint,))
     row = await cur.fetchone(); await conn.close()
@@ -430,7 +451,10 @@ async def edit_token(cq: CallbackQuery, state: FSMContext, db: DB):
         await cq.answer()
     except Exception:
         pass
-    mint = cq.data.split(":", 1)[1]
+    ref = cq.data.split(":", 1)[1]
+    mint = await _resolve_token_ref(db, ref)
+    if not mint:
+        return await cq.answer("Token not found", show_alert=True)
     try:
         await _ensure_token_settings(db, mint)
         await state.clear()
@@ -445,17 +469,23 @@ async def edit_page(cq: CallbackQuery, db: DB):
         await cq.answer()
     except Exception:
         pass
-    mint = cq.data.split(":")[1]
+    ref = cq.data.split(":")[1]
+    mint = await _resolve_token_ref(db, ref)
+    if not mint:
+        return await cq.answer("Token not found", show_alert=True)
     text, values = await _render_edit_page(db, mint)
     await cq.message.answer(text, parse_mode="HTML", reply_markup=token_edit_page_kb(mint, 1, values))
 
 @router.callback_query(F.data.startswith("editset:"))
-async def edit_set(cq: CallbackQuery, state: FSMContext):
+async def edit_set(cq: CallbackQuery, state: FSMContext, db: DB):
     try:
         await cq.answer()
     except Exception:
         pass
-    _, mint, key = cq.data.split(":", 2)
+    _, ref, key = cq.data.split(":", 2)
+    mint = await _resolve_token_ref(db, ref)
+    if not mint:
+        return await cq.answer("Token not found", show_alert=True)
     await state.clear()
     await state.set_state(EditTokenFlow.value)
     await state.update_data(edit_mint=mint, edit_key=key)
@@ -547,8 +577,11 @@ async def advert_menu(cq: CallbackQuery, db: DB, state: FSMContext):
         )
     await cq.answer()
 @router.callback_query(F.data.startswith("adtoken:"))
-async def advert_pick_token(cq: CallbackQuery, state: FSMContext):
-    mint = cq.data.split(":", 1)[1]
+async def advert_pick_token(cq: CallbackQuery, state: FSMContext, db: DB):
+    ref = cq.data.split(":", 1)[1]
+    mint = await _resolve_token_ref(db, ref)
+    if not mint:
+        return await cq.answer("Token not found", show_alert=True)
     meta = await fetch_token_meta(mint)
     label = meta.get("symbol") or meta.get("name") or mint[:6]
     await state.clear(); await state.set_state(AdvertFlow.link)
@@ -629,8 +662,11 @@ async def trending_menu(cq: CallbackQuery, db: DB, state: FSMContext):
         )
     await cq.answer()
 @router.callback_query(F.data.startswith("trendtoken:"))
-async def trending_pick_token(cq: CallbackQuery, state: FSMContext):
-    mint = cq.data.split(":", 1)[1]
+async def trending_pick_token(cq: CallbackQuery, state: FSMContext, db: DB):
+    ref = cq.data.split(":", 1)[1]
+    mint = await _resolve_token_ref(db, ref)
+    if not mint:
+        return await cq.answer("Token not found", show_alert=True)
     meta = await fetch_token_meta(mint)
     label = meta.get("symbol") or meta.get("name") or mint[:6]
     await state.clear(); await state.set_state(TrendingFlow.link)
