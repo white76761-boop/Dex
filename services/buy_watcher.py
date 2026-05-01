@@ -49,21 +49,60 @@ def _first(*vals):
     return None
 
 
+
+def _normalise_tx_hash(value: Any) -> str | None:
+    """Return a Tonviewer-friendly transaction hash, or None if not real.
+
+    TonAPI event_id is commonly account:lt:hash. The old bot sometimes used
+    only the LT (for example 72582651000012), which Tonviewer opens as 400.
+    """
+    if value in (None, "", [], {}):
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if "/transaction/" in s:
+        s = s.split("/transaction/", 1)[1]
+    s = s.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    if ":" in s:
+        tail = s.rsplit(":", 1)[-1].strip()
+        if tail:
+            s = tail
+    # base64/base64url TON tx hash is normally 43-44 chars; allow common API hex too.
+    if re.fullmatch(r"[A-Za-z0-9_-]{40,96}={0,2}", s) or re.fullmatch(r"[A-Fa-f0-9]{64}", s):
+        if not s.isdigit():
+            return s
+    return None
+
+def _event_cursor(ev: dict) -> str | None:
+    raw = _first(ev.get("event_id"), ev.get("id"), ev.get("lt"), ev.get("hash"), ev.get("tx_hash"), ev.get("transaction_hash"))
+    return str(raw) if raw not in (None, "", [], {}) else None
+
+def _is_successful_action(action: dict) -> bool:
+    status = str(_first(action.get("status"), action.get("success"), action.get("result"), "ok")).lower()
+    return status not in {"failed", "fail", "false", "error", "aborted"}
+
 def _event_id(ev: dict) -> str:
-    return str(_first(ev.get("event_id"), ev.get("id"), ev.get("lt"), ev.get("hash"), ev.get("tx_hash"), ev.get("transaction_hash"), ev.get("timestamp"), time.time()))
+    return _event_cursor(ev) or ""
 
 
-def _tx_hash(ev: dict) -> str:
+def _tx_hash(ev: dict) -> str | None:
     for key in ("tx_hash", "hash", "transaction_hash", "event_id", "id"):
-        v = ev.get(key)
-        if v:
-            return str(v)
+        h = _normalise_tx_hash(ev.get(key))
+        if h:
+            return h
+    tx = ev.get("transaction") or ev.get("tx") or {}
+    if isinstance(tx, dict):
+        for key in ("hash", "tx_hash", "transaction_hash"):
+            h = _normalise_tx_hash(tx.get(key))
+            if h:
+                return h
     for action in ev.get("actions") or []:
         for v in _deep_values(action):
-            s = str(v)
-            if re.fullmatch(r"[A-Fa-f0-9]{44,128}", s):
-                return s
-    return _event_id(ev)
+            h = _normalise_tx_hash(v)
+            if h:
+                return h
+    return None
 
 
 def _addr_from(obj: Any) -> str | None:
@@ -108,8 +147,14 @@ def _asset_address(asset: Any) -> str:
 
 
 def _parse_swap_action(action: dict, token: str) -> Optional[dict]:
-    data = action.get("JettonSwap") or action.get("jetton_swap") or action.get("swap") or action.get("data") or action
-    if not _contains_addr(data, token):
+    # Only accept explicit DEX swap actions. Generic transfer actions caused fake/old buy spam.
+    if not _is_successful_action(action):
+        return None
+    action_type = str(action.get("type") or action.get("action_type") or "").lower()
+    data = action.get("JettonSwap") or action.get("jetton_swap")
+    if not data and "swap" in action_type:
+        data = action.get("data") or action.get("swap")
+    if not isinstance(data, dict) or not _contains_addr(data, token):
         return None
 
     # TonAPI action shape commonly contains dex_incoming_transfer and dex_outgoing_transfer.
@@ -125,7 +170,7 @@ def _parse_swap_action(action: dict, token: str) -> Optional[dict]:
 
     # A buy means TON came in and the tracked jetton went out to the buyer.
     token_is_out = token in str(outgoing) or token == out_addr or token in str(out_asset)
-    ton_is_in = in_sym in TON_SYMBOLS or "ton" == in_addr.lower() or "native" in in_sym.lower() or "toncoin" in str(in_asset).lower()
+    ton_is_in = (in_sym in TON_SYMBOLS or in_addr in {"", "ton", "TON_NATIVE"} or in_addr == "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c" or "native" in str(in_asset).lower() or "toncoin" in str(in_asset).lower())
     if not (token_is_out and ton_is_in):
         return None
 
@@ -170,6 +215,8 @@ class BuyWatcher:
         self._running = False
         self._last_ton_price = 0.0
         self._chat_type_cache: Dict[int, str] = {}
+        # Prevent replaying historical swaps after redeploy/restart.
+        self._started_at = int(time.time())
 
     async def _chat_type(self, chat_id: int) -> str:
         if chat_id in self._chat_type_cache:
@@ -218,11 +265,11 @@ class BuyWatcher:
             await asyncio.sleep(settings.POLL_INTERVAL_SEC)
 
     async def _fetch_events(self, mint: str, last_sig: str | None):
-        newest_sig = None
         collected: list[dict] = []
+        newest_token_cursor: str | None = None
         pools = await self.rpc.discover_pools(mint)
         if not pools:
-            # Fallback: try events on the jetton master itself. This catches some launchpad/router interactions.
+            # Fallback only reads the jetton master events, but parsing stays strict: explicit swap actions only.
             pools = [{"address": mint, "dex": "tonapi"}]
 
         for pool in pools[:8]:
@@ -230,46 +277,61 @@ class BuyWatcher:
             if not addr:
                 continue
             source_key = f"{mint}:{addr}"
-            source_last = await self._get_last_sig(self._conn, source_key) if hasattr(self, "_conn") else last_sig
+            source_last = await self._get_last_sig(self._conn, source_key) if hasattr(self, "_conn") else None
+            source_newest: str | None = None
 
-            # DeDust direct trades endpoint when the pool is known.
+            # DeDust direct trades endpoint when the pool is known. Only use trades with a real tx hash.
             if pool.get("dex") == "dedust":
                 trades = await self.rpc.latest_dedust_trades(addr, 20)
                 for tr in trades:
-                    sig = str(_first(tr.get("txHash"), tr.get("tx_hash"), tr.get("hash"), tr.get("lt"), tr.get("createdAt"), ""))
-                    if not sig:
+                    cursor = str(_first(tr.get("txHash"), tr.get("tx_hash"), tr.get("hash"), tr.get("lt"), tr.get("createdAt"), ""))
+                    if not cursor:
                         continue
-                    if newest_sig is None:
-                        newest_sig = sig
-                    if sig == source_last or sig == last_sig:
+                    source_newest = source_newest or cursor
+                    newest_token_cursor = newest_token_cursor or cursor
+                    if cursor == source_last or cursor == last_sig:
                         break
                     ev = _parse_dedust_trade(tr, mint)
-                    if ev:
-                        ev["signature"] = ev.get("signature") or sig
+                    txh = _normalise_tx_hash(_first(tr.get("txHash"), tr.get("tx_hash"), tr.get("hash"), ev.get("signature") if ev else None))
+                    if ev and txh:
+                        ev["signature"] = txh
                         collected.append(ev)
 
-            # TonAPI account events can expose STON.fi and DeDust swap actions.
+            # TonAPI account events expose STON.fi and some DeDust swap actions.
             events = await self.rpc.get_account_events(addr, 30)
             for raw in events:
-                sig = _event_id(raw)
-                if newest_sig is None:
-                    newest_sig = sig
-                if sig == source_last or sig == last_sig:
+                cursor = _event_cursor(raw)
+                if not cursor:
+                    continue
+                source_newest = source_newest or cursor
+                newest_token_cursor = newest_token_cursor or cursor
+                if cursor == source_last or cursor == last_sig:
                     break
+
+                txh = _tx_hash(raw)
+                if not txh:
+                    # Do not post if Tonviewer cannot open the tx. This prevents wrong 400 links.
+                    continue
                 for action in raw.get("actions") or []:
                     parsed = _parse_swap_action(action, mint)
                     if parsed:
-                        parsed.update({"signature": _tx_hash(raw), "timestamp": raw.get("timestamp") or int(time.time())})
+                        parsed.update({"signature": txh, "timestamp": raw.get("timestamp") or int(time.time())})
                         collected.append(parsed)
                         break
-            if newest_sig:
-                # Store a cursor per pool as well as per token to avoid replaying per-source events.
+
+            if source_newest:
                 try:
-                    await self._set_last_sig(self._conn, source_key, newest_sig)
+                    await self._set_last_sig(self._conn, source_key, source_newest)
                 except Exception:
                     pass
 
-        return list(reversed(collected)), newest_sig
+        # Drop duplicates by real tx hash before posting.
+        uniq: dict[str, dict] = {}
+        for ev in collected:
+            sig = ev.get("signature")
+            if sig:
+                uniq[sig] = ev
+        return list(reversed(list(uniq.values()))), newest_token_cursor
 
     async def tick(self):
         conn = await self.db.connect()
@@ -295,7 +357,21 @@ class BuyWatcher:
             if newest_sig and newest_sig != last_sig and not new_events:
                 await self._set_last_sig(conn, mint, newest_sig)
             for ev in new_events:
-                sig = ev["signature"]
+                sig = ev.get("signature")
+                if not sig:
+                    continue
+                # Do not replay old swaps after restart/redeploy. Cursor is still advanced below.
+                try:
+                    ev_ts = int(float(ev.get("timestamp") or 0))
+                except Exception:
+                    ev_ts = 0
+                if ev_ts and ev_ts < self._started_at - 30:
+                    await self._set_last_sig(conn, mint, sig)
+                    continue
+                # one transaction can appear in multiple pool/account feeds; never post twice
+                if await self._get_last_sig(conn, f"posted:{sig}"):
+                    continue
+                await self._set_last_sig(conn, f"posted:{sig}", "1")
                 await self._set_last_sig(conn, mint, sig)
                 await self._post_buy(mint, ev, tgt, ad_text, ad_link, price)
         await conn.close()
