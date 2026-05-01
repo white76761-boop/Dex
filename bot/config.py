@@ -16,6 +16,17 @@ class Settings(BaseModel):
     OWNER_ID: int = int(_get("OWNER_ID"))
     BOT_USERNAME: str = _get("BOT_USERNAME", "BazaTonBuyBot")
     POST_CHANNEL: str = _get("POST_CHANNEL", "@BazaTonHub")
+    # Optional: message thread id within the POST_CHANNEL (for forum topics).
+    # When set to a non-zero value, buy and leaderboard posts will be sent into this
+    # thread rather than the root of the channel. This allows the bot to target the
+    # "Trending" topic in a forum group (e.g. https://t.me/BazaTonHub/6) instead of
+    # spamming the general chat. Leave empty or 0 to send directly to the channel.
+    POST_CHANNEL_THREAD_ID: int | None = (
+        int(os.getenv("POST_CHANNEL_THREAD_ID", "0"))
+        if os.getenv("POST_CHANNEL_THREAD_ID", "").strip().isdigit()
+        else None
+    )
+
     LISTING_URL: str = _get("LISTING_URL", "https://t.me/BazaTonHub/8")
     TRENDING_URL: str = _get("TRENDING_URL", "https://t.me/BazaTonHub/6")
     LEADERBOARD_MESSAGE_ID: int = int(_get("LEADERBOARD_MESSAGE_ID", "0"))
