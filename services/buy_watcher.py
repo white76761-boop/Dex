@@ -1,8 +1,9 @@
 from __future__ import annotations
+
 import asyncio
 import time
 import re
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 import aiosqlite
 
 from bot.config import settings
@@ -11,12 +12,10 @@ from services.ads_service import AdsService
 from utils.price import ton_usd
 from utils.formatter import build_buy_message_group, build_buy_message_channel
 from bot.keyboards import buy_kb
+from utils.ton_client import TonClient
 
-TX_URL = settings.TONVIEWER_BASE.rstrip("/") + "/transaction/{sig}"
-NANOTON = 1_000_000_000
-GROYPAD_GRADUATION_NANO = 1050 * NANOTON
-STONFI_HINTS = ("ston", "ston.fi", "stonfi")
-DEDUST_HINTS = ("dedust", "de dust")
+TX_URL = "https://tonviewer.com/transaction/{sig}"
+TON_SYMBOLS = {"TON", "TONCOIN"}
 
 
 def _safe_float(v) -> float:
@@ -26,221 +25,145 @@ def _safe_float(v) -> float:
         return 0.0
 
 
-def _addr(v) -> str | None:
-    if isinstance(v, str):
-        return v
-    if isinstance(v, dict):
-        return v.get("address") or v.get("account_address") or v.get("raw") or v.get("friendly")
-    return None
-
-
-def _action_type(a: dict) -> str:
-    return str(a.get("type") or a.get("action_type") or "").lower()
-
-
-def _details(a: dict) -> dict:
-    d = a.get("details") or {}
-    # TonAPI often nests by snake/camel case inside details.
-    for key in ("jetton_swap", "JettonSwap", "ton_transfer", "TonTransfer", "jetton_transfer", "JettonTransfer"):
-        if isinstance(d.get(key), dict):
-            return d.get(key) or {}
-    return d
-
-
-def _asset_address(asset: dict | None) -> str | None:
-    if not isinstance(asset, dict):
-        return None
-    jetton = asset.get("jetton") or asset.get("jetton_info") or asset.get("metadata") or asset
-    return _addr(jetton.get("address") if isinstance(jetton, dict) else jetton) or asset.get("address") or asset.get("contract_address")
-
-
-def _asset_symbol(asset: dict | None) -> str:
-    if not isinstance(asset, dict):
-        return "TOKEN"
-    if (asset.get("type") or "").lower() == "ton" or asset.get("is_ton"):
-        return "TON"
-    meta = asset.get("metadata") or asset.get("jetton") or {}
-    return (meta.get("symbol") if isinstance(meta, dict) else None) or asset.get("symbol") or "TOKEN"
-
-
-def _asset_amount(asset: dict | None) -> float:
-    if not isinstance(asset, dict):
-        return 0.0
-    for k in ("amount", "quantity", "value"):
-        if asset.get(k) is not None:
-            raw = asset.get(k)
-            break
+def _deep_values(obj: Any):
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _deep_values(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _deep_values(v)
     else:
-        raw = 0
-    decimals = asset.get("decimals")
-    if decimals is None:
-        meta = asset.get("metadata") or asset.get("jetton") or {}
-        decimals = meta.get("decimals") if isinstance(meta, dict) else None
-    try:
-        rawf = float(raw or 0)
-        dec = int(decimals if decimals is not None else (9 if rawf > 10_000_000 else 0))
-        if dec and rawf > 10_000:
-            return rawf / (10 ** dec)
-        return rawf
-    except Exception:
-        return 0.0
+        yield obj
 
 
-def _is_ton_asset(asset: dict | None) -> bool:
-    if not isinstance(asset, dict):
+def _contains_addr(obj: Any, addr: str) -> bool:
+    if not addr:
         return False
-    sym = _asset_symbol(asset).upper()
-    return sym in {"TON", "WTON"} or (asset.get("type") or "").lower() == "ton" or asset.get("is_ton") is True
+    return addr in str(obj)
+
+
+def _first(*vals):
+    for v in vals:
+        if v not in (None, "", [], {}):
+            return v
+    return None
 
 
 def _event_id(ev: dict) -> str:
-    return str(ev.get("event_id") or ev.get("id") or ev.get("trace_id") or ev.get("lt") or ev.get("timestamp") or "")
+    return str(_first(ev.get("event_id"), ev.get("id"), ev.get("lt"), ev.get("hash"), ev.get("tx_hash"), ev.get("transaction_hash"), ev.get("timestamp"), time.time()))
 
 
-def _event_hash(ev: dict) -> str:
-    return str(ev.get("event_id") or ev.get("trace_id") or ev.get("id") or ev.get("hash") or ev.get("lt") or int(time.time()))
-
-
-def _event_lt(ev: dict) -> int | None:
-    for k in ("lt", "account_event_seqno", "seqno"):
-        try:
-            if ev.get(k) is not None:
-                return int(ev[k])
-        except Exception:
-            pass
-    return None
-
-
-def _extract_opcode(a: dict) -> str | None:
-    d = _details(a)
-    candidates = [a.get("opcode"), d.get("opcode"), d.get("op_code"), d.get("operation"), d.get("operation_code")]
-    for c in candidates:
-        if c is None:
-            continue
-        s = str(c).lower()
-        if s.startswith("0x"):
-            return s
-        try:
-            return hex(int(s))
-        except Exception:
-            m = re.search(r"0x[0-9a-f]+", s)
-            if m:
-                return m.group(0)
-    return None
-
-
-def _buyer_from_action(a: dict) -> str:
-    d = _details(a)
-    for k in ("sender", "sender_address", "source", "from", "owner", "account"):
-        v = _addr(d.get(k) or a.get(k))
+def _tx_hash(ev: dict) -> str:
+    for key in ("tx_hash", "hash", "transaction_hash", "event_id", "id"):
+        v = ev.get(key)
         if v:
-            return v
-    return "Unknown"
+            return str(v)
+    for action in ev.get("actions") or []:
+        for v in _deep_values(action):
+            s = str(v)
+            if re.fullmatch(r"[A-Fa-f0-9]{44,128}", s):
+                return s
+    return _event_id(ev)
 
 
-def _find_swap_buy(ev: dict, token: str) -> Optional[dict]:
-    actions = ev.get("actions") or []
-    for a in actions:
-        if "swap" not in _action_type(a):
-            continue
-        d = _details(a)
-        in_asset = d.get("asset_in") or d.get("from_asset") or d.get("in") or d.get("ask_asset") or d.get("token_in")
-        out_asset = d.get("asset_out") or d.get("to_asset") or d.get("out") or d.get("offer_asset") or d.get("token_out")
-        out_addr = (_asset_address(out_asset) or "").lower()
-        in_addr = (_asset_address(in_asset) or "").lower()
-        if out_addr != token.lower() and in_addr == token.lower():
-            continue
-        if out_addr != token.lower():
-            # Some parsers only expose jetton_master fields directly.
-            out_addr = str(d.get("jetton_master") or d.get("jetton_address") or "").lower()
-            if out_addr != token.lower():
-                continue
-        if not _is_ton_asset(in_asset):
-            # still accept if amount in TON is exposed directly
-            spent = _safe_float(d.get("ton_in") or d.get("amount_in_ton"))
-        else:
-            spent = _asset_amount(in_asset)
-        got = _asset_amount(out_asset) or _safe_float(d.get("amount_out") or d.get("jetton_amount"))
-        if spent <= 0 and _safe_float(d.get("value")) > 0:
-            spent = _safe_float(d.get("value")) / NANOTON
-        if got <= 0:
-            got = _safe_float(d.get("received") or 0)
-        if spent <= 0 and got <= 0:
-            continue
-        platform = "stonfi" if any(h in str(a).lower() for h in STONFI_HINTS) else "dedust" if any(h in str(a).lower() for h in DEDUST_HINTS) else "dex"
-        return {
-            "buyer": _buyer_from_action(a),
-            "got_tokens": got,
-            "spent_ton": spent,
-            "spent_value": spent,
-            "spent_symbol": "TON",
-            "signature": _event_hash(ev),
-            "timestamp": ev.get("timestamp") or int(time.time()),
-            "platform": platform,
-        }
+def _addr_from(obj: Any) -> str | None:
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, dict):
+        return _first(obj.get("address"), obj.get("account_address"), obj.get("account"), obj.get("user_friendly"), obj.get("raw"))
     return None
 
 
-def _find_opcode_buy(ev: dict, token: str) -> Optional[dict]:
-    actions = ev.get("actions") or []
-    for a in actions:
-        d = _details(a)
-        op = _extract_opcode(a)
-        destination = _addr(d.get("recipient") or d.get("destination") or d.get("to") or a.get("destination"))
-        is_to_token = (destination or "").lower() == token.lower()
-        raw = str(a).lower()
-        if not is_to_token and token.lower() not in raw:
+def _amount_from(obj: dict, *keys, decimals: int = 9) -> float:
+    for k in keys:
+        v = obj.get(k) if isinstance(obj, dict) else None
+        if v in (None, ""):
             continue
-        if op not in {settings.GROYPAD_BUY_OPCODE.lower(), settings.BLUM_BUY_OPCODE.lower()}:
+        try:
+            f = float(v)
+            # TonAPI and DEX APIs often return nanoTON / smallest jetton units as strings.
+            if abs(f) >= 1_000_000 and float(v).is_integer():
+                return f / (10 ** decimals)
+            return f
+        except Exception:
             continue
-        value = d.get("amount") or d.get("value") or a.get("amount") or 0
-        spent_ton = _safe_float(value)
-        if spent_ton > 10_000:
-            spent_ton = spent_ton / NANOTON
-        platform = "groypad" if op == settings.GROYPAD_BUY_OPCODE.lower() else "blum"
-        return {
-            "buyer": _buyer_from_action(a),
-            "got_tokens": _safe_float(d.get("tokens_out") or d.get("jetton_amount") or d.get("amount_out") or 0),
-            "spent_ton": spent_ton,
-            "spent_value": spent_ton,
-            "spent_symbol": "TON",
-            "signature": _event_hash(ev),
-            "timestamp": ev.get("timestamp") or int(time.time()),
-            "platform": platform,
-        }
-    return None
+    return 0.0
 
 
-def _find_buy_in_event(ev: dict, token: str) -> Optional[dict]:
-    if ev.get("is_scam") or ev.get("in_progress"):
+def _asset_symbol(asset: Any) -> str:
+    if isinstance(asset, str):
+        return asset.upper()
+    if isinstance(asset, dict):
+        meta = asset.get("metadata") or asset
+        return str(_first(meta.get("symbol"), meta.get("name"), meta.get("type"), "")).upper()
+    return ""
+
+
+def _asset_address(asset: Any) -> str:
+    if isinstance(asset, str):
+        return asset
+    if isinstance(asset, dict):
+        return str(_first(asset.get("address"), asset.get("contract_address"), asset.get("jetton_address"), asset.get("master"), asset.get("root"), ""))
+    return ""
+
+
+def _parse_swap_action(action: dict, token: str) -> Optional[dict]:
+    data = action.get("JettonSwap") or action.get("jetton_swap") or action.get("swap") or action.get("data") or action
+    if not _contains_addr(data, token):
         return None
-    return _find_opcode_buy(ev, token) or _find_swap_buy(ev, token)
 
+    # TonAPI action shape commonly contains dex_incoming_transfer and dex_outgoing_transfer.
+    incoming = _first(data.get("dex_incoming_transfer"), data.get("incoming_transfer"), data.get("asset_in"), data.get("in"), data.get("input"), data.get("from")) or {}
+    outgoing = _first(data.get("dex_outgoing_transfer"), data.get("outgoing_transfer"), data.get("asset_out"), data.get("out"), data.get("output"), data.get("to")) or {}
 
-def _stack_int(item) -> int:
-    if isinstance(item, dict):
-        v = item.get("value") or item.get("num") or item.get("number") or "0"
-    else:
-        v = item
-    if isinstance(v, int):
-        return v
-    s = str(v or "0")
-    try:
-        return int(s, 16) if s.startswith("0x") else int(s)
-    except Exception:
-        return 0
+    in_asset = _first(incoming.get("asset") if isinstance(incoming, dict) else None, data.get("asset_in"), data.get("token_in"), data.get("in_token"))
+    out_asset = _first(outgoing.get("asset") if isinstance(outgoing, dict) else None, data.get("asset_out"), data.get("token_out"), data.get("out_token"))
+    in_addr = _asset_address(in_asset)
+    out_addr = _asset_address(out_asset)
+    in_sym = _asset_symbol(in_asset)
+    out_sym = _asset_symbol(out_asset)
 
-
-def _progress_bar(progress: float | None) -> str | None:
-    if progress is None:
+    # A buy means TON came in and the tracked jetton went out to the buyer.
+    token_is_out = token in str(outgoing) or token == out_addr or token in str(out_asset)
+    ton_is_in = in_sym in TON_SYMBOLS or "ton" == in_addr.lower() or "native" in in_sym.lower() or "toncoin" in str(in_asset).lower()
+    if not (token_is_out and ton_is_in):
         return None
-    p = max(0, min(100, float(progress)))
-    filled = int(round(p / 10))
-    return "█" * filled + "░" * (10 - filled) + f" {p:.1f}%"
+
+    spent_ton = _amount_from(incoming if isinstance(incoming, dict) else data, "amount", "value", "quantity", "amount_in") or _amount_from(data, "amount_in", "ton_amount", "spent_ton")
+    got_tokens = _amount_from(outgoing if isinstance(outgoing, dict) else data, "amount", "value", "quantity", "amount_out", decimals=9) or _amount_from(data, "amount_out", "jetton_amount", "got_tokens", decimals=9)
+    buyer = _addr_from(_first(data.get("user_wallet"), data.get("wallet"), data.get("sender"), data.get("owner"), data.get("recipient"))) or "Unknown"
+    if spent_ton <= 0 and got_tokens <= 0:
+        return None
+    return {"buyer": buyer, "got_tokens": got_tokens, "spent_ton": spent_ton, "spent_value": spent_ton, "spent_symbol": "TON"}
+
+
+def _parse_dedust_trade(tr: dict, token: str) -> Optional[dict]:
+    if not _contains_addr(tr, token):
+        return None
+    # Handle several possible DeDust trade response shapes.
+    asset_in = _first(tr.get("assetIn"), tr.get("asset_in"), tr.get("in"), tr.get("fromAsset"), tr.get("from")) or {}
+    asset_out = _first(tr.get("assetOut"), tr.get("asset_out"), tr.get("out"), tr.get("toAsset"), tr.get("to")) or {}
+    in_sym = _asset_symbol(asset_in)
+    out_addr = _asset_address(asset_out)
+    token_is_out = token in str(asset_out) or token == out_addr
+    ton_is_in = in_sym in TON_SYMBOLS or "native" in str(asset_in).lower() or "ton" == str(asset_in).lower()
+    if not (token_is_out and ton_is_in):
+        return None
+    spent_ton = _amount_from(tr, "amountIn", "amount_in", "volumeIn", "inAmount", "tonAmount") or _amount_from(asset_in if isinstance(asset_in, dict) else {}, "amount", "value")
+    got_tokens = _amount_from(tr, "amountOut", "amount_out", "outAmount", "jettonAmount") or _amount_from(asset_out if isinstance(asset_out, dict) else {}, "amount", "value")
+    return {
+        "buyer": str(_first(tr.get("sender"), tr.get("account"), tr.get("user"), tr.get("wallet"), "Unknown")),
+        "got_tokens": got_tokens,
+        "spent_ton": spent_ton,
+        "spent_value": spent_ton,
+        "spent_symbol": "TON",
+        "signature": str(_first(tr.get("txHash"), tr.get("tx_hash"), tr.get("hash"), tr.get("lt"), tr.get("createdAt"), time.time())),
+        "timestamp": int(_safe_float(_first(tr.get("timestamp"), tr.get("createdAt"), time.time()))),
+    }
 
 
 class BuyWatcher:
-    def __init__(self, bot, db, rpc):
+    def __init__(self, bot, db, rpc: TonClient):
         self.bot = bot
         self.db = db
         self.rpc = rpc
@@ -264,25 +187,25 @@ class BuyWatcher:
         rows = await cur.fetchall()
         m = {}
         for r in rows:
-            token = r["token_mint"]
-            m.setdefault(token, {"groups": [], "post_channel": True})
-            m[token]["groups"].append(r)
+            mint = r["token_mint"]
+            m.setdefault(mint, {"groups": [], "post_channel": False})
+            m[mint]["groups"].append(r)
         cur = await conn.execute("SELECT mint, post_mode FROM tracked_tokens")
         rows2 = await cur.fetchall()
         for r in rows2:
-            token = r["mint"]
-            m.setdefault(token, {"groups": [], "post_channel": True})
-            # BazaTon requirement: every buy goes to the trending section/channel.
-            m[token]["post_channel"] = True
+            mint = r["mint"]
+            m.setdefault(mint, {"groups": [], "post_channel": False})
+            if r["post_mode"] == "channel":
+                m[mint]["post_channel"] = True
         return m
 
-    async def _get_last_id(self, conn: aiosqlite.Connection, token: str) -> str | None:
-        cur = await conn.execute("SELECT v FROM state_kv WHERE k=?", (f"last_event:{token}",))
+    async def _get_last_sig(self, conn: aiosqlite.Connection, key: str) -> str | None:
+        cur = await conn.execute("SELECT v FROM state_kv WHERE k=?", (f"last_sig:{key}",))
         row = await cur.fetchone()
         return row["v"] if row else None
 
-    async def _set_last_id(self, conn: aiosqlite.Connection, token: str, eid: str):
-        await conn.execute("INSERT INTO state_kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (f"last_event:{token}", eid))
+    async def _set_last_sig(self, conn: aiosqlite.Connection, key: str, sig: str):
+        await conn.execute("INSERT INTO state_kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (f"last_sig:{key}", sig))
         await conn.commit()
 
     async def run_forever(self):
@@ -294,99 +217,111 @@ class BuyWatcher:
                 pass
             await asyncio.sleep(settings.POLL_INTERVAL_SEC)
 
-    async def _fetch_events(self, token: str, last_id: str | None):
-        newest_id = None
-        collected = []
-        before_lt = None
-        try:
-            for _ in range(4):
-                events = await self.rpc.get_account_events(token, limit=30, before_lt=before_lt)
-                if not events:
-                    break
-                for ev in events:
-                    eid = _event_id(ev)
-                    if not eid:
-                        continue
-                    if newest_id is None:
-                        newest_id = eid
-                    if eid == last_id:
-                        return list(reversed(collected)), newest_id
-                    buy = _find_buy_in_event(ev, token)
-                    if buy:
-                        collected.append(buy)
-                before_lt = _event_lt(events[-1])
-                if not before_lt:
-                    break
-            return list(reversed(collected)), newest_id
-        except Exception:
-            return [], newest_id
+    async def _fetch_events(self, mint: str, last_sig: str | None):
+        newest_sig = None
+        collected: list[dict] = []
+        pools = await self.rpc.discover_pools(mint)
+        if not pools:
+            # Fallback: try events on the jetton master itself. This catches some launchpad/router interactions.
+            pools = [{"address": mint, "dex": "tonapi"}]
 
-    async def _get_bonding_progress(self, token: str, platform: str, meta: dict) -> float | None:
-        if meta.get("progress") is not None:
-            return float(meta.get("progress"))
-        if platform != "groypad":
-            return None
-        try:
-            res = await self.rpc.run_get_method(token, "get_meme_data", [])
-            stack = (res or {}).get("stack") or []
-            if len(stack) >= 12:
-                raised = _stack_int(stack[11])
-                return min(100.0, (raised * 100.0) / GROYPAD_GRADUATION_NANO)
-        except Exception:
-            return None
-        return None
+        for pool in pools[:8]:
+            addr = pool.get("address")
+            if not addr:
+                continue
+            source_key = f"{mint}:{addr}"
+            source_last = await self._get_last_sig(self._conn, source_key) if hasattr(self, "_conn") else last_sig
+
+            # DeDust direct trades endpoint when the pool is known.
+            if pool.get("dex") == "dedust":
+                trades = await self.rpc.latest_dedust_trades(addr, 20)
+                for tr in trades:
+                    sig = str(_first(tr.get("txHash"), tr.get("tx_hash"), tr.get("hash"), tr.get("lt"), tr.get("createdAt"), ""))
+                    if not sig:
+                        continue
+                    if newest_sig is None:
+                        newest_sig = sig
+                    if sig == source_last or sig == last_sig:
+                        break
+                    ev = _parse_dedust_trade(tr, mint)
+                    if ev:
+                        ev["signature"] = ev.get("signature") or sig
+                        collected.append(ev)
+
+            # TonAPI account events can expose STON.fi and DeDust swap actions.
+            events = await self.rpc.get_account_events(addr, 30)
+            for raw in events:
+                sig = _event_id(raw)
+                if newest_sig is None:
+                    newest_sig = sig
+                if sig == source_last or sig == last_sig:
+                    break
+                for action in raw.get("actions") or []:
+                    parsed = _parse_swap_action(action, mint)
+                    if parsed:
+                        parsed.update({"signature": _tx_hash(raw), "timestamp": raw.get("timestamp") or int(time.time())})
+                        collected.append(parsed)
+                        break
+            if newest_sig:
+                # Store a cursor per pool as well as per token to avoid replaying per-source events.
+                try:
+                    await self._set_last_sig(self._conn, source_key, newest_sig)
+                except Exception:
+                    pass
+
+        return list(reversed(collected)), newest_sig
 
     async def tick(self):
         conn = await self.db.connect()
+        self._conn = conn
         targets = await self._load_targets(conn)
         ads_svc = AdsService(conn)
         active_ad_text, active_ad_link = await ads_svc.get_active_ad()
         ad_text = active_ad_text or await ads_svc.get_owner_fallback()
         ad_link = active_ad_link if active_ad_text else None
-        price = await ton_usd(self.rpc)
-        if price > 0:
+        price = await ton_usd(settings.TON_PRICE_URL)
+        if price and price > 0:
             self._last_ton_price = price
         else:
             price = self._last_ton_price
 
-        for token, tgt in targets.items():
-            last_id = await self._get_last_id(conn, token)
-            new_events, newest_id = await self._fetch_events(token, last_id)
-            if last_id is None:
-                if newest_id:
-                    await self._set_last_id(conn, token, newest_id)
+        for mint, tgt in targets.items():
+            last_sig = await self._get_last_sig(conn, mint)
+            new_events, newest_sig = await self._fetch_events(mint, last_sig)
+            if last_sig is None:
+                if newest_sig:
+                    await self._set_last_sig(conn, mint, newest_sig)
                 continue
-            if newest_id and newest_id != last_id and not new_events:
-                await self._set_last_id(conn, token, newest_id)
+            if newest_sig and newest_sig != last_sig and not new_events:
+                await self._set_last_sig(conn, mint, newest_sig)
             for ev in new_events:
-                await self._set_last_id(conn, token, ev["signature"])
-                await self._post_buy(token, ev, tgt, ad_text, ad_link, price)
+                sig = ev["signature"]
+                await self._set_last_sig(conn, mint, sig)
+                await self._post_buy(mint, ev, tgt, ad_text, ad_link, price)
         await conn.close()
 
-    async def _post_buy(self, token: str, ev: dict, tgt: dict, ad_text: str | None, ad_link: str | None, ton_price: float):
-        meta = await fetch_token_meta(token, self.rpc)
-        token_name = meta.get("symbol") or meta.get("name") or token[:6]
+    async def _post_buy(self, mint: str, ev: dict, tgt: dict, ad_text: str | None, ad_link: str | None, ton_price: float):
+        meta = await fetch_token_meta(mint)
+        token_name = meta.get("symbol") or meta.get("name") or mint[:6]
         spent_ton = float(ev.get("spent_ton") or ev.get("spent_sol") or 0.0)
         got_tokens = float(ev.get("got_tokens") or 0.0)
+        buyer = ev.get("buyer") or "Unknown"
         spent_symbol = ev.get("spent_symbol") or "TON"
-        spent_value = float(ev.get("spent_value") or spent_ton)
-        platform = ev.get("platform") or meta.get("platform") or "ton"
-        spent_usd = spent_ton * float(ton_price or 0.0) if spent_ton > 0 and ton_price > 0 else 0.0
-        effective_spent_ton = spent_ton if spent_symbol == "TON" else 0.0
-        if effective_spent_ton < float(settings.MIN_BUY_DEFAULT_TON):
+        spent_value = float(ev.get("spent_value") or spent_ton or 0.0)
+        live_ton_price = float(ton_price or self._last_ton_price or 0.0)
+        spent_usd = spent_ton * live_ton_price if spent_ton and live_ton_price else 0.0
+        if spent_ton < float(settings.MIN_BUY_DEFAULT_TON):
             return
 
-        progress = await self._get_bonding_progress(token, platform, meta)
-        progress_bar = _progress_bar(progress) if platform in {"groypad", "blum"} else None
         now_ts = int(time.time())
         try:
             conn2 = await self.db.connect()
             if spent_usd > 0:
-                await conn2.execute("INSERT INTO buys(mint, usd, ts) VALUES(?,?,?)", (token, spent_usd, now_ts))
+                await conn2.execute("INSERT INTO buys(mint, usd, ts) VALUES(?,?,?)", (mint, float(spent_usd), now_ts))
             if meta.get("priceUsd") is not None:
-                await conn2.execute("INSERT INTO price_snapshots(mint, price_usd, ts) VALUES(?,?,?)", (token, float(meta.get("priceUsd")), now_ts))
+                await conn2.execute("INSERT INTO price_snapshots(mint, price_usd, ts) VALUES(?,?,?)", (mint, float(meta.get("priceUsd")), now_ts))
             if meta.get("mcapUsd") is not None:
-                await conn2.execute("INSERT INTO mcap_snapshots(mint, mcap_usd, ts) VALUES(?,?,?)", (token, float(meta.get("mcapUsd")), now_ts))
+                await conn2.execute("INSERT INTO mcap_snapshots(mint, mcap_usd, ts) VALUES(?,?,?)", (mint, float(meta.get("mcapUsd")), now_ts))
             await conn2.commit(); await conn2.close()
         except Exception:
             pass
@@ -397,16 +332,15 @@ class BuyWatcher:
         try:
             for _r in tgt.get("groups", []):
                 if _r.get("telegram_link"):
-                    tg_url = _r.get("telegram_link"); break
+                    tg_url = _r.get("telegram_link")
+                    break
         except Exception:
             pass
-        if meta.get("telegram") and not tg_url:
-            tg_url = meta.get("telegram")
         try:
             conn_tg = await self.db.connect()
-            cur2 = await conn_tg.execute("SELECT telegram_link FROM tracked_tokens WHERE mint=?", (token,))
+            cur2 = await conn_tg.execute("SELECT telegram_link FROM tracked_tokens WHERE mint=?", (mint,))
             row2 = await cur2.fetchone()
-            cur3 = await conn_tg.execute("SELECT buy_step, min_buy, emoji, media_file_id, media_kind FROM token_settings WHERE mint=?", (token,))
+            cur3 = await conn_tg.execute("SELECT buy_step, min_buy, emoji, media_file_id, media_kind FROM token_settings WHERE mint=?", (mint,))
             row3 = await cur3.fetchone()
             await conn_tg.close()
             if row2 and row2[0]:
@@ -416,71 +350,51 @@ class BuyWatcher:
         except Exception:
             pass
 
-        base_kwargs = dict(
-            token_symbol=token_name,
-            emoji="✅",
-            spent_sol=effective_spent_ton,
-            spent_usd=spent_usd,
-            spent_symbol=spent_symbol,
-            spent_value=spent_value,
-            got_tokens=got_tokens,
-            buyer=ev.get("buyer") or "Unknown",
-            tx_url=tx_url,
-            price_usd=meta.get("priceUsd"),
-            mcap_usd=meta.get("mcapUsd"),
-            tg_url=tg_url,
-            ad_text=ad_text,
-            ad_link=ad_link,
-            chart_url=meta.get("dexUrl") or f"https://tonviewer.com/{token}",
-            platform=platform,
-            progress_bar=progress_bar,
-        )
-        msg_text_channel = build_buy_message_channel(**base_kwargs)
+        def make_msg(emoji: str):
+            return build_buy_message_channel(
+                token_symbol=token_name,
+                emoji=emoji,
+                spent_sol=spent_ton,
+                spent_usd=spent_usd,
+                spent_symbol=spent_symbol,
+                spent_value=spent_value,
+                got_tokens=got_tokens,
+                buyer=buyer,
+                tx_url=tx_url,
+                price_usd=meta.get("priceUsd"),
+                mcap_usd=meta.get("mcapUsd"),
+                tg_url=tg_url,
+                ad_text=ad_text,
+                ad_link=ad_link,
+                chart_url=meta.get("dexUrl"),
+            )
 
-        for r in tgt.get("groups", []):
+        for r in tgt["groups"]:
             min_buy = max(float(settings.MIN_BUY_DEFAULT_TON), float(r["min_buy_sol"] or 0), float(token_cfg.get("min_buy") or 0))
-            if effective_spent_ton < min_buy:
+            if spent_ton < min_buy:
                 continue
-            kwargs = dict(base_kwargs)
-            kwargs.update({"emoji": token_cfg.get("emoji") or r["emoji"] or "🟢", "tg_url": tg_url or r["telegram_link"]})
-            msg_text2 = build_buy_message_group(**kwargs)
+            emoji = token_cfg.get("emoji") or r["emoji"] or "🟢"
             media = token_cfg.get("media_file_id") or r["media_file_id"]
             media_kind = token_cfg.get("media_kind") or "photo"
             chat_id = int(r["group_id"])
+            msg_text = make_msg(emoji)
             try:
-                if await self._chat_type(chat_id) == "channel" or not media:
-                    await self.bot.send_message(chat_id, msg_text2, reply_markup=buy_kb(token), disable_web_page_preview=True, parse_mode="HTML")
-                elif media_kind == "animation":
-                    await self.bot.send_animation(chat_id, media, caption=msg_text2, reply_markup=buy_kb(token), parse_mode="HTML")
-                elif media_kind == "video":
-                    await self.bot.send_video(chat_id, media, caption=msg_text2, reply_markup=buy_kb(token), parse_mode="HTML")
-                elif media_kind == "document":
-                    await self.bot.send_document(chat_id, media, caption=msg_text2, reply_markup=buy_kb(token), parse_mode="HTML")
+                if media and await self._chat_type(chat_id) != "channel":
+                    if media_kind == "video":
+                        await self.bot.send_video(chat_id, media, caption=msg_text, reply_markup=buy_kb(mint), parse_mode="HTML")
+                    else:
+                        await self.bot.send_photo(chat_id, media, caption=msg_text, reply_markup=buy_kb(mint), parse_mode="HTML")
                 else:
-                    await self.bot.send_photo(chat_id, media, caption=msg_text2, reply_markup=buy_kb(token), parse_mode="HTML")
+                    await self.bot.send_message(chat_id, msg_text, reply_markup=buy_kb(mint), disable_web_page_preview=True, parse_mode="HTML")
             except Exception:
                 pass
 
-        channel_min_buy = max(float(settings.MIN_BUY_DEFAULT_TON), float(token_cfg.get("min_buy") or 0))
-        if settings.POST_CHANNEL and effective_spent_ton >= channel_min_buy:
-            # Send buys into the configured trending channel/topic.  If a thread id is
-            # provided via POST_CHANNEL_THREAD_ID, messages will be sent to that
-            # thread; otherwise they go directly to the channel.
+        if tgt.get("post_channel") and settings.POST_CHANNEL:
             try:
-                send_kwargs = {
-                    "chat_id": settings.POST_CHANNEL,
-                    "text": msg_text_channel,
-                    "reply_markup": buy_kb(token),
-                    "disable_web_page_preview": True,
-                    "parse_mode": "HTML",
-                }
-                if getattr(settings, "POST_CHANNEL_THREAD_ID", None):
-                    # When targeting a forum topic, include message_thread_id so
-                    # Telegram routes the message correctly.
-                    send_kwargs["message_thread_id"] = settings.POST_CHANNEL_THREAD_ID
-                await self.bot.send_message(**send_kwargs)
+                await self.bot.send_message(settings.POST_CHANNEL, make_msg("✅"), reply_markup=buy_kb(mint), disable_web_page_preview=True, parse_mode="HTML")
             except Exception:
                 pass
 
     async def close(self):
+        self._running = False
         await self.rpc.close()
