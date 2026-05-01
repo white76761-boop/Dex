@@ -110,11 +110,35 @@ class LeaderboardUpdater:
             await self._set_kv(conn, "leaderboard_message_id", str(fixed_mid))
         mid = str(fixed_mid) if fixed_mid else await self._get_kv(conn, "leaderboard_message_id")
         if not mid:
-            msg = await self.bot.send_message(settings.POST_CHANNEL, text, reply_markup=leaderboard_kb(), disable_web_page_preview=True, parse_mode="HTML")
+            # Send the leaderboard into the configured channel/topic.  Use
+            # message_thread_id when configured so the leaderboard appears in
+            # the Trending topic instead of the general chat.
+            send_kwargs = {
+                "chat_id": settings.POST_CHANNEL,
+                "text": text,
+                "reply_markup": leaderboard_kb(),
+                "disable_web_page_preview": True,
+                "parse_mode": "HTML",
+            }
+            if getattr(settings, "POST_CHANNEL_THREAD_ID", None):
+                send_kwargs["message_thread_id"] = settings.POST_CHANNEL_THREAD_ID
+            msg = await self.bot.send_message(**send_kwargs)
             await self._set_kv(conn, "leaderboard_message_id", str(msg.message_id))
         else:
             try:
-                await self.bot.edit_message_text(text=text, chat_id=settings.POST_CHANNEL, message_id=int(mid), reply_markup=leaderboard_kb(), disable_web_page_preview=True, parse_mode="HTML")
+                edit_kwargs = {
+                    "chat_id": settings.POST_CHANNEL,
+                    "message_id": int(mid),
+                    "text": text,
+                    "reply_markup": leaderboard_kb(),
+                    "disable_web_page_preview": True,
+                    "parse_mode": "HTML",
+                }
+                if getattr(settings, "POST_CHANNEL_THREAD_ID", None):
+                    # When targeting a topic, include message_thread_id for edits.  Telegram
+                    # tolerates this parameter when editing messages in topics.
+                    edit_kwargs["message_thread_id"] = settings.POST_CHANNEL_THREAD_ID
+                await self.bot.edit_message_text(**edit_kwargs)
             except TelegramBadRequest as e:
                 err = str(e).lower()
                 if "message is not modified" in err:

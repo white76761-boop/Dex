@@ -463,8 +463,22 @@ class BuyWatcher:
 
         channel_min_buy = max(float(settings.MIN_BUY_DEFAULT_TON), float(token_cfg.get("min_buy") or 0))
         if settings.POST_CHANNEL and effective_spent_ton >= channel_min_buy:
+            # Send buys into the configured trending channel/topic.  If a thread id is
+            # provided via POST_CHANNEL_THREAD_ID, messages will be sent to that
+            # thread; otherwise they go directly to the channel.
             try:
-                await self.bot.send_message(settings.POST_CHANNEL, msg_text_channel, reply_markup=buy_kb(token), disable_web_page_preview=True, parse_mode="HTML")
+                send_kwargs = {
+                    "chat_id": settings.POST_CHANNEL,
+                    "text": msg_text_channel,
+                    "reply_markup": buy_kb(token),
+                    "disable_web_page_preview": True,
+                    "parse_mode": "HTML",
+                }
+                if getattr(settings, "POST_CHANNEL_THREAD_ID", None):
+                    # When targeting a forum topic, include message_thread_id so
+                    # Telegram routes the message correctly.
+                    send_kwargs["message_thread_id"] = settings.POST_CHANNEL_THREAD_ID
+                await self.bot.send_message(**send_kwargs)
             except Exception:
                 pass
 
