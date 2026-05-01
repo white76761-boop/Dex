@@ -14,10 +14,10 @@ from services.payment_verifier import find_recent_payment
 from services.ads_service import AdsService
 from services.token_meta import fetch_token_meta
 from database.db import DB
-from utils.ton_rpc import TonClient
+from utils.ton_client import TonClient
 
 router = Router()
-MINT_RE = re.compile(r"^(EQ|UQ)[A-Za-z0-9_-]{46,}$")
+CA_RE = re.compile(r"^(?:EQ|UQ)[A-Za-z0-9_-]{46}$|^(?:-?1|0):[A-Fa-f0-9]{64}$")
 
 class TrendingFlow(StatesGroup):
     link = State()
@@ -84,8 +84,8 @@ def _extract_tx_sig(v: str) -> str:
     t = (v or '').strip()
     if 'tonviewer.com/transaction/' in t:
         t = t.split('tonviewer.com/transaction/', 1)[1]
-    if 'tonviewer.com/transaction/' in t:
-        t = t.split('tonviewer.com/transaction/', 1)[1]
+    if 'ton.fm/tx/' in t:
+        t = t.split('ton.fm/tx/', 1)[1]
     if '?' in t:
         t = t.split('?', 1)[0]
     if '#' in t:
@@ -336,8 +336,8 @@ async def menu_add(cq: CallbackQuery, state: FSMContext):
 @router.message(AddTokenFlow.mint)
 async def add_token_mint(msg: Message, state: FSMContext, db: DB):
     mint = (msg.text or "").strip()
-    if not MINT_RE.match(mint):
-        return await msg.reply("Send a valid TON token address.")
+    if not CA_RE.match(mint):
+        return await msg.reply("Send a valid TON jetton contract address.")
     meta = await _upsert_tracked_token(db, mint)
     if msg.chat.type in ("group", "supergroup"):
         conn = await db.connect()
@@ -377,7 +377,7 @@ async def menu_view(cq: CallbackQuery, db: DB):
         row = await cur.fetchone(); await conn.close()
         if row:
             await cq.message.answer(
-                f"Token Details\nName: <b>{row['name'] or row['symbol'] or mint[:6]}</b>\nSymbol: <b>{row['symbol'] or '—'}</b>\nAddress: <code>{mint}</code>\nTelegram: {row['telegram_link'] or '—'}",
+                f"Token Details\nName: <b>{row['name'] or row['symbol'] or mint[:6]}</b>\nSymbol: <b>{row['symbol'] or '—'}</b>\nMint: <code>{mint}</code>\nTelegram: {row['telegram_link'] or '—'}",
                 parse_mode="HTML",
             )
             return await cq.answer()
@@ -397,7 +397,7 @@ async def view_token(cq: CallbackQuery, db: DB):
     if not row:
         return await cq.answer("Token not found", show_alert=True)
     await cq.message.answer(
-        f"Token Details\nName: <b>{row['name'] or row['symbol'] or mint[:6]}</b>\nSymbol: <b>{row['symbol'] or '—'}</b>\nAddress: <code>{mint}</code>\nTelegram: {row['telegram_link'] or '—'}",
+        f"Token Details\nName: <b>{row['name'] or row['symbol'] or mint[:6]}</b>\nSymbol: <b>{row['symbol'] or '—'}</b>\nMint: <code>{mint}</code>\nTelegram: {row['telegram_link'] or '—'}",
         parse_mode="HTML",
     )
     await cq.answer()
@@ -705,7 +705,7 @@ async def invoice_txhash_submit(msg: Message, state: FSMContext, db: DB, rpc: To
     if not invoice_id:
         invoice_id = await _latest_pending_invoice_for_user(db, msg.from_user.id)
     if not invoice_id or len(sig) < 20:
-        return await msg.answer('Send a valid transaction hash or TON viewer link.')
+        return await msg.answer('Send a valid transaction hash or Tonviewer link.')
     conn = await db.connect()
     cur = await conn.execute("SELECT status, amount_sol FROM invoices WHERE id=?", (invoice_id,))
     inv = await cur.fetchone()
@@ -773,7 +773,7 @@ async def forceadd(msg: Message, command: CommandObject, db: DB):
     if not await _ensure_owner(msg):
         return
     if not command.args:
-        return await msg.reply("Usage:\n<code>/forceadd MINT|https://t.me/yourlink</code>\nOr:\n<code>/forceadd MINT https://t.me/yourlink</code>", parse_mode="HTML")
+        return await msg.reply("Usage:\n<code>/forceadd CA|https://t.me/yourlink</code>\nOr:\n<code>/forceadd CA https://t.me/yourlink</code>", parse_mode="HTML")
     mint, tg = _parse_forceadd_args(command.args)
     if not mint:
         return await msg.reply("❌ Missing token mint.")
@@ -785,7 +785,7 @@ async def forcetrending(msg: Message, command: CommandObject, db: DB):
     if not await _ensure_owner(msg):
         return
     if not command.args:
-        return await msg.reply("Usage:\n<code>/forcetrending MINT [hours] [telegram_link]</code>", parse_mode="HTML")
+        return await msg.reply("Usage:\n<code>/forcetrending CA [hours] [telegram_link]</code>", parse_mode="HTML")
     mint, tg = _parse_forceadd_args(command.args)
     if not mint:
         return await msg.reply("❌ Missing token mint.")
@@ -806,7 +806,7 @@ async def forceleaderboard(msg: Message, command: CommandObject, db: DB):
     if not await _ensure_owner(msg):
         return
     if not command.args:
-        return await msg.reply("Usage:\n<code>/forceleaderboard MINT</code>", parse_mode="HTML")
+        return await msg.reply("Usage:\n<code>/forceleaderboard CA</code>", parse_mode="HTML")
     mint = command.args.strip().split()[0]
     await _upsert_tracked_token(db, mint)
     conn = await db.connect()
@@ -819,7 +819,7 @@ async def removetrending(msg: Message, command: CommandObject, db: DB):
     if not await _ensure_owner(msg):
         return
     if not command.args:
-        return await msg.reply("Usage:\n<code>/removetrending MINT</code>", parse_mode="HTML")
+        return await msg.reply("Usage:\n<code>/removetrending CA</code>", parse_mode="HTML")
     mint = command.args.strip().split()[0]
     conn = await db.connect()
     await conn.execute("UPDATE tracked_tokens SET force_trending=0, trend_until_ts=0 WHERE mint=?", (mint,))
@@ -831,7 +831,7 @@ async def disabletoken(msg: Message, command: CommandObject, db: DB):
     if not await _ensure_owner(msg):
         return
     if not command.args:
-        return await msg.reply("Usage:\n<code>/disabletoken MINT</code>", parse_mode="HTML")
+        return await msg.reply("Usage:\n<code>/disabletoken CA</code>", parse_mode="HTML")
     mint = command.args.strip().split()[0]
     conn = await db.connect()
     await conn.execute("UPDATE tracked_tokens SET post_mode='disabled', force_trending=0 WHERE mint=?", (mint,))
@@ -843,7 +843,7 @@ async def enabletoken(msg: Message, command: CommandObject, db: DB):
     if not await _ensure_owner(msg):
         return
     if not command.args:
-        return await msg.reply("Usage:\n<code>/enabletoken MINT</code>", parse_mode="HTML")
+        return await msg.reply("Usage:\n<code>/enabletoken CA</code>", parse_mode="HTML")
     mint = command.args.strip().split()[0]
     await _upsert_tracked_token(db, mint)
     conn = await db.connect()

@@ -3,7 +3,7 @@ from aiogram.types import InlineKeyboardMarkup
 from urllib.parse import quote
 from bot.config import settings
 
-BUY_TEMPLATE = "https://tonviewer.com/{mint}"
+BUY_TEMPLATE = "https://app.ston.fi/swap?chartVisible=false&ft=TON&tt={mint}"
 
 
 def _display_emoji_value(value: str | None) -> str:
@@ -21,7 +21,7 @@ def _display_emoji_value(value: str | None) -> str:
 
 def buy_kb(mint: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="Chart", url=BUY_TEMPLATE.format(mint=mint))
+    kb.button(text="Buy on STON.fi", url=BUY_TEMPLATE.format(mint=quote(mint, safe='')))
     kb.button(text="Trending", url=settings.TRENDING_URL)
     kb.adjust(2)
     return kb.as_markup()
@@ -41,7 +41,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     kb.button(text="👀 View Tokens", callback_data="menu:view")
     kb.button(text="⚙️ Group Settings", callback_data="menu:group")
     kb.button(text="📈 Trending", callback_data="menu:trending")
-    kb.button(text="💎 advert", callback_data="menu:advert")
+    kb.button(text="💎 Advert", callback_data="menu:advert")
     kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
 
@@ -108,7 +108,7 @@ def invoice_kb(invoice_id: int, amount_sol: float) -> InlineKeyboardMarkup:
     kb.button(text="↻ Refresh", callback_data=f"invoice:refresh:{invoice_id}")
     kb.button(text="✅ I've Paid", callback_data=f"invoice:paid:{invoice_id}")
     kb.button(text="🧾 Submit Tx Hash", callback_data=f"invoice:txhash:{invoice_id}")
-    pay_url = f"ton://transfer/{quote(settings.PAYMENT_WALLET)}?amount={int(amount_sol * 1000000000)}"
+    pay_url = f"ton://transfer/{quote(settings.PAYMENT_WALLET)}?amount={int(float(amount_sol) * 1_000_000_000)}"
     kb.button(text=f"Open wallet to pay {amount_sol:g} TON", url=pay_url)
     kb.adjust(2, 2, 1)
     return kb.as_markup()
